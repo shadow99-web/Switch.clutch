@@ -49,7 +49,7 @@ async def osint_username(interaction: discord.Interaction, username: str):
     
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(f"{HF_API_URL}/api/username", params={"username": username}, timeout=50) as resp:
+            async with session.get(f"{HF_API_URL}/api/username", params={"username": username}, timeout=140) as resp:
                 if resp.status != 200:
                     await interaction.followup.send("❌ Error connecting to OSINT backend service.")
                     return
