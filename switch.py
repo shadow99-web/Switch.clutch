@@ -1,5 +1,6 @@
 import os
 import threading
+import asyncio
 from flask import Flask
 import discord
 from discord import app_commands
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 HF_API_URL = os.getenv("HF_API_URL")  # e.g., https://your-space-name.hf.space
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") # e.g., https://your-render-service.onrender.com
 
 # 1. Initialize Flask web server for 24/7 keep-alive pings
 app = Flask("")
@@ -28,16 +30,45 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# 2. Discord Bot Class Setup
+# 2. Discord Bot Class Setup with Self-Ping Background Task
 class APISyncOSINTBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
+        self.web_session = None
 
     async def setup_hook(self):
+        self.web_session = aiohttp.ClientSession()
+        
+        # Start the background self-ping loop if RENDER_EXTERNAL_URL is available
+        if RENDER_EXTERNAL_URL:
+            self.loop.create_task(self.keep_alive_ping())
+            print(f"[+] Self-ping keep-alive task initialized for: {RENDER_EXTERNAL_URL}")
+        else:
+            print("[!] Warning: RENDER_EXTERNAL_URL is not set. Self-ping loop disabled.")
+
         await self.tree.sync()
         print(f"[+] Bot synchronized and online as {self.user}")
+
+    async def keep_alive_ping(self):
+        """Pings its own Render external URL every 3 minutes to prevent spin-down."""
+        await self.wait_until_ready()
+        
+        while not self.is_closed():
+            try:
+                async with self.web_session.get(RENDER_EXTERNAL_URL) as resp:
+                    print(f"[Keep-Alive] Self-ping status: {resp.status}")
+            except Exception as e:
+                print(f"[Keep-Alive] Ping failed: {e}")
+            
+            # Wait for 3 minutes (180 seconds) before the next ping
+            await asyncio.sleep(180)
+
+    async def close(self):
+        if self.web_session:
+            await self.web_session.close()
+        await super().close()
 
 bot = APISyncOSINTBot()
 osint_group = app_commands.Group(name="osint", description="Distributed OSINT Intelligence Suite")
@@ -65,8 +96,8 @@ async def osint_username(interaction: discord.Interaction, username: str):
         timestamp=discord.utils.utcnow()
     )
     
-    if len(result_text) > 3900:
-        result_text = result_text[:3900] + "\n... [Output truncated]"
+    if len(result_text) > 4000:
+        result_text = result_text[:4000] + "\n... [Output truncated]"
         
     embed.description = f"```ansi\n{result_text}\n```"
     embed.set_footer(text="OSINT Bot • Powered by Hugging Face API")
@@ -165,3 +196,4 @@ if __name__ == "__main__":
     else:
         keep_alive()
         bot.run(TOKEN)
+                
