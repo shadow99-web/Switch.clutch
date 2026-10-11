@@ -1,6 +1,7 @@
 import os
 import threading
 import asyncio
+import io  # <--- 1. IMPORT IO FOR FILE GENERATION
 from flask import Flask
 import discord
 from discord import app_commands
@@ -96,14 +97,20 @@ async def osint_username(interaction: discord.Interaction, username: str):
         timestamp=discord.utils.utcnow()
     )
     
-    if len(result_text) > 4000:
-        result_text = result_text[:4000] + "\n... [Output truncated]"
+    display_text = result_text
+    if len(display_text) > 3900:
+        display_text = display_text[:3900] + "\n... [Output truncated in embed preview]"
         
-    embed.description = f"```ansi\n{result_text}\n```"
-    embed.set_footer(text="OSINT Bot • Powered by Hugging Face API")
-    await interaction.followup.send(embed=embed)
+    embed.description = f"```ansi\n{display_text}\n```"
+    embed.set_footer(text="OSINT BOT • SHADOW CREATION")
 
-@osint_group.command(name="email", description="Scan email registrations via Hugging Face Holehe API")
+    # --- 2. GENERATE AND ATTACH DOWNLOADABLE .TXT FILE ---
+    file_bytes = io.BytesIO(result_text.encode("utf-8"))
+    file = discord.File(file_bytes, filename=f"username_{username}_report.txt")
+
+    await interaction.followup.send(embed=embed, file=file)
+
+@osint_group.command(name="email", description="Scan email registrations")
 @app_commands.describe(email="Target email address")
 async def osint_email(interaction: discord.Interaction, email: str):
     await interaction.response.defer(thinking=True)
@@ -126,12 +133,18 @@ async def osint_email(interaction: discord.Interaction, email: str):
         timestamp=discord.utils.utcnow()
     )
     
-    if len(result_text) > 3900:
-        result_text = result_text[:3900] + "\n... [Output truncated]"
+    display_text = result_text
+    if len(display_text) > 3900:
+        display_text = display_text[:3900] + "\n... [Output truncated in embed preview]"
         
-    embed.description = f"```ansi\n{result_text}\n```"
-    embed.set_footer(text="OSINT Bot • Powered by Hugging Face API")
-    await interaction.followup.send(embed=embed)
+    embed.description = f"```ansi\n{display_text}\n```"
+    embed.set_footer(text="OSINT Bot • RED ঌ ")
+
+    # --- 2. GENERATE AND ATTACH DOWNLOADABLE .TXT FILE ---
+    file_bytes = io.BytesIO(result_text.encode("utf-8"))
+    file = discord.File(file_bytes, filename=f"email_report.txt")
+
+    await interaction.followup.send(embed=embed, file=file)
 
 @osint_group.command(name="phone", description="Analyze phone number via Hugging Face API")
 @app_commands.describe(phone="Target phone number with country code (e.g., +15555555555)")
@@ -160,7 +173,12 @@ async def osint_phone(interaction: discord.Interaction, phone: str):
     )
     embed.description = f"```yaml\n{result_text}\n```"
     embed.set_footer(text="OSINT Bot • Powered by Hugging Face API")
-    await interaction.followup.send(embed=embed)
+
+    # --- 2. GENERATE AND ATTACH DOWNLOADABLE .TXT FILE ---
+    file_bytes = io.BytesIO(result_text.encode("utf-8"))
+    file = discord.File(file_bytes, filename=f"phone_{phone.replace('+', '')}_report.txt")
+
+    await interaction.followup.send(embed=embed, file=file)
 
 @osint_group.command(name="help", description="Display the OSINT toolkit help menu")
 async def osint_help(interaction: discord.Interaction):
@@ -196,4 +214,3 @@ if __name__ == "__main__":
     else:
         keep_alive()
         bot.run(TOKEN)
-                
