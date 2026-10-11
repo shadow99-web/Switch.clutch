@@ -177,14 +177,15 @@ async def osint_phone(interaction: discord.Interaction, phone: str):
 
     await interaction.followup.send(embed=embed, file=file)
 
-@osint_group.command(name="domain", description="Analyze domain infrastructure and DNS via Hugging Face API")
+@@osint_group.command(name="domain", description="Analyze domain infrastructure and DNS via Hugging Face API")
 @app_commands.describe(domain="Target domain (e.g., example.com)")
 async def osint_domain(interaction: discord.Interaction, domain: str):
     await interaction.response.defer(thinking=True)
     
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(f"{HF_API_URL}/api/domain", params={"domain": domain}, timeout=30) as resp:
+            # Bumping timeout to 60 seconds
+            async with session.get(f"{HF_API_URL}/api/domain", params={"domain": domain}, timeout=60) as resp:
                 if resp.status != 200:
                     await interaction.followup.send("❌ Error connecting to domain intelligence endpoint.")
                     return
