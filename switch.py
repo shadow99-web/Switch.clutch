@@ -1,7 +1,7 @@
 import os
 import threading
 import asyncio
-import io  # <--- 1. IMPORT IO FOR FILE GENERATION
+import io  # IMPORT IO FOR FILE GENERATION
 from flask import Flask
 import discord
 from discord import app_commands
@@ -104,7 +104,6 @@ async def osint_username(interaction: discord.Interaction, username: str):
     embed.description = f"```ansi\n{display_text}\n```"
     embed.set_footer(text="OSINT BOT • SHADOW CREATION")
 
-    # --- 2. GENERATE AND ATTACH DOWNLOADABLE .TXT FILE ---
     file_bytes = io.BytesIO(result_text.encode("utf-8"))
     file = discord.File(file_bytes, filename=f"username_{username}_report.txt")
 
@@ -140,7 +139,6 @@ async def osint_email(interaction: discord.Interaction, email: str):
     embed.description = f"```ansi\n{display_text}\n```"
     embed.set_footer(text="OSINT Bot • RED ঌ ")
 
-    # --- 2. GENERATE AND ATTACH DOWNLOADABLE .TXT FILE ---
     file_bytes = io.BytesIO(result_text.encode("utf-8"))
     file = discord.File(file_bytes, filename=f"email_report.txt")
 
@@ -174,9 +172,46 @@ async def osint_phone(interaction: discord.Interaction, phone: str):
     embed.description = f"```yaml\n{result_text}\n```"
     embed.set_footer(text="OSINT Bot • Powered by Hugging Face API")
 
-    # --- 2. GENERATE AND ATTACH DOWNLOADABLE .TXT FILE ---
     file_bytes = io.BytesIO(result_text.encode("utf-8"))
     file = discord.File(file_bytes, filename=f"phone_{phone.replace('+', '')}_report.txt")
+
+    await interaction.followup.send(embed=embed, file=file)
+
+@osint_group.command(name="domain", description="Analyze domain infrastructure and DNS via Hugging Face API")
+@app_commands.describe(domain="Target domain (e.g., example.com)")
+async def osint_domain(interaction: discord.Interaction, domain: str):
+    await interaction.response.defer(thinking=True)
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(f"{HF_API_URL}/api/domain", params={"domain": domain}, timeout=30) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send("❌ Error connecting to domain intelligence endpoint.")
+                    return
+                data = await resp.json()
+                if "error" in data:
+                    await interaction.followup.send(f"❌ Error: {data['error']}")
+                    return
+                result_text = data.get("result", "No data returned.")
+        except Exception as e:
+            await interaction.followup.send(f"❌ Connection timeout or error: {str(e)}")
+            return
+
+    embed = discord.Embed(
+        title=f"Domain Intelligence: {domain}",
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow()
+    )
+    
+    display_text = result_text
+    if len(display_text) > 3900:
+        display_text = display_text[:3900] + "\n... [Output truncated in embed preview]"
+        
+    embed.description = f"```yaml\n{display_text}\n```"
+    embed.set_footer(text="OSINT Bot • Powered by Hugging Face API")
+
+    file_bytes = io.BytesIO(result_text.encode("utf-8"))
+    file = discord.File(file_bytes, filename=f"domain_{domain}_report.txt")
 
     await interaction.followup.send(embed=embed, file=file)
 
@@ -203,6 +238,11 @@ async def osint_help(interaction: discord.Interaction):
         value="Analyzes metadata, carrier details, and regional attributes for a given phone number.", 
         inline=False
     )
+    embed.add_field(
+        name="/osint domain", 
+        value="Performs WHOIS registration lookups, DNS infrastructure scans, and subdomain enumeration.", 
+        inline=False
+    )
     embed.set_footer(text="OSINT Bot • 24/7 Keep-Alive Active")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -214,3 +254,4 @@ if __name__ == "__main__":
     else:
         keep_alive()
         bot.run(TOKEN)
+                     
