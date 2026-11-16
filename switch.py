@@ -15,7 +15,6 @@ load_dotenv()
 # CONFIGURATION
 # ==========================================
 TOKEN = os.getenv("DISCORD_TOKEN")
-# Ensure no trailing slash so endpoints format correctly
 HF_API_URL = os.getenv("HF_API_URL", "").rstrip("/") 
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
@@ -51,18 +50,13 @@ class APISyncOSINTBot(commands.Bot):
         self.web_session = None
 
     async def setup_hook(self):
-        # 1. Start global aiohttp session
         self.web_session = aiohttp.ClientSession()
-        
-        # 2. Start web server
         await start_web_server()
 
-        # 3. Start self-ping loop
         if RENDER_EXTERNAL_URL:
             self.loop.create_task(self.keep_alive_ping())
             print(f"[Keep-Alive] Self-ping task initialized for: {RENDER_EXTERNAL_URL}")
 
-        # 4. Sync slash commands
         await self.tree.sync()
         print(f"[+] Bot synchronized and online as {self.user}")
 
@@ -74,7 +68,7 @@ class APISyncOSINTBot(commands.Bot):
                     pass
             except Exception:
                 pass
-            await asyncio.sleep(180) # 3 minutes
+            await asyncio.sleep(180)
 
     async def close(self):
         if self.web_session:
@@ -105,16 +99,15 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # HELPER FUNCTION (Handles Cache & API Fetching)
 # ==========================================
 async def fetch_osint(endpoint: str, params: dict, timeout: int):
-    """Fetches data from HF Space with caching."""
     cache_key = f"{endpoint}:{str(params)}"
     
-    # 1. Check Cache
+    # Check Cache
     if cache_key in CACHE:
         if time.time() - CACHE[cache_key]["time"] < CACHE_TTL:
             print(f"[CACHE] Hit for {cache_key}")
             return CACHE[cache_key]["result"], None
 
-    # 2. Fetch from API
+    # Fetch from API
     try:
         async with bot.web_session.get(f"{HF_API_URL}{endpoint}", params=params, timeout=timeout) as resp:
             if resp.status != 200:
@@ -129,7 +122,7 @@ async def fetch_osint(endpoint: str, params: dict, timeout: int):
             
             result = data.get("result", "No data returned.")
             
-            # 3. Save to Cache
+            # Save to Cache
             CACHE[cache_key] = {"result": result, "time": time.time()}
             return result, None
             
@@ -202,7 +195,7 @@ async def osint_domain(interaction: discord.Interaction, domain: str, invisible:
 
 @osint_group.command(name="ip", description="Geolocate an IP address")
 @app_commands.describe(ip="Target IP", invisible="Only you can see the results")
-@app_commands.checks.cooldown(1, 60.0, time=1, key=lambda i: i.user.id)
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
 async def osint_ip(interaction: discord.Interaction, ip: str, invisible: bool = False):
     await interaction.response.defer(thinking=True, ephemeral=invisible)
     result, error = await fetch_osint("/api/ip", {"ip": ip}, 15)
