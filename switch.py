@@ -1,70 +1,77 @@
 import os
-import threading
 import asyncio
-import io  # IMPORT IO FOR FILE GENERATION
-from flask import Flask
+import io
+import time
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands
 import aiohttp
-import phonenumbers
-from dotenv import load_dotenv
 
-load_dotenv()
+# ==========================================
+# CONFIGURATION
+# ==========================================
 TOKEN = os.getenv("DISCORD_TOKEN")
-HF_API_URL = os.getenv("HF_API_URL")  # e.g., https://your-space-name.hf.space
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") # e.g., https://your-render-service.onrender.com
+# Ensure no trailing slash so endpoints format correctly
+HF_API_URL = os.getenv("HF_API_URL", "").rstrip("/") 
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# 1. Initialize Flask web server for 24/7 keep-alive pings
-app = Flask("")
+# ==========================================
+# CACHING SYSTEM (10 Minute TTL)
+# ==========================================
+CACHE = {}
+CACHE_TTL = 600  # 10 minutes in seconds
 
-@app.route("/")
-def home():
-    return "OSINT Bot is online and active 24/7!"
-
-def run_flask():
+# ==========================================
+# AIOHTTP KEEP-ALIVE (For Render)
+# ==========================================
+async def start_web_server():
+    async def handle(request):
+        return web.Response(text="OSINT Bot is online and active 24/7!")
+    
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[Keep-Alive] Web server listening on port {port}")
 
-def keep_alive():
-    t = threading.Thread(target=run_flask)
-    t.daemon = True
-    t.start()
-
-# 2. Discord Bot Class Setup with Self-Ping Background Task
+# ==========================================
+# BOT SETUP
+# ==========================================
 class APISyncOSINTBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.web_session = None
 
     async def setup_hook(self):
+        # 1. Start global aiohttp session
         self.web_session = aiohttp.ClientSession()
         
-        # Start the background self-ping loop if RENDER_EXTERNAL_URL is available
+        # 2. Start web server
+        await start_web_server()
+
+        # 3. Start self-ping loop
         if RENDER_EXTERNAL_URL:
             self.loop.create_task(self.keep_alive_ping())
-            print(f"[+] Self-ping keep-alive task initialized for: {RENDER_EXTERNAL_URL}")
-        else:
-            print("[!] Warning: RENDER_EXTERNAL_URL is not set. Self-ping loop disabled.")
+            print(f"[Keep-Alive] Self-ping task initialized for: {RENDER_EXTERNAL_URL}")
 
+        # 4. Sync slash commands
         await self.tree.sync()
         print(f"[+] Bot synchronized and online as {self.user}")
 
     async def keep_alive_ping(self):
-        """Pings its own Render external URL every 3 minutes to prevent spin-down."""
         await self.wait_until_ready()
-        
         while not self.is_closed():
             try:
                 async with self.web_session.get(RENDER_EXTERNAL_URL) as resp:
-                    print(f"[Keep-Alive] Self-ping status: {resp.status}")
-            except Exception as e:
-                print(f"[Keep-Alive] Ping failed: {e}")
-            
-            # Wait for 3 minutes (180 seconds) before the next ping
-            await asyncio.sleep(180)
+                    pass
+            except Exception:
+                pass
+            await asyncio.sleep(180) # 3 minutes
 
     async def close(self):
         if self.web_session:
@@ -74,185 +81,230 @@ class APISyncOSINTBot(commands.Bot):
 bot = APISyncOSINTBot()
 osint_group = app_commands.Group(name="osint", description="Distributed OSINT Intelligence Suite")
 
-@osint_group.command(name="username", description="Scan username via Hugging Face Maigret API")
-@app_commands.describe(username="Target username")
-async def osint_username(interaction: discord.Interaction, username: str):
-    await interaction.response.defer(thinking=True)
-    
-    async with aiohttp.ClientSession() as session:
+# ==========================================
+# ERROR HANDLER (For Cooldowns)
+# ==========================================
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(
+            f"⏳ **Slow down!** You can use this command again in `{error.retry_after:.1f}s`.", 
+            ephemeral=True
+        )
+    else:
+        print(f"[ERROR] {type(error).__name__}: {error}")
         try:
-            async with session.get(f"{HF_API_URL}/api/username", params={"username": username}, timeout=320) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send("❌ Error connecting to OSINT backend service.")
-                    return
-                data = await resp.json()
-                result_text = data.get("result", "No data returned.")
-        except Exception as e:
-            await interaction.followup.send(f"❌ Connection timeout or error: {str(e)}")
-            return
+            await interaction.response.send_message("❌ An unexpected error occurred.", ephemeral=True)
+        except:
+            pass
 
-    embed = discord.Embed(
-        title=f"Username Intelligence: {username}",
-        color=discord.Color.dark_purple(),
-        timestamp=discord.utils.utcnow()
-    )
+# ==========================================
+# HELPER FUNCTION (Handles Cache & API Fetching)
+# ==========================================
+async def fetch_osint(endpoint: str, params: dict, timeout: int):
+    """Fetches data from HF Space with caching."""
+    cache_key = f"{endpoint}:{str(params)}"
     
-    display_text = result_text
-    if len(display_text) > 3900:
-        display_text = display_text[:3900] + "\n... [Output truncated in embed preview]"
-        
-    embed.description = f"```ansi\n{display_text}\n```"
-    embed.set_footer(text="OSINT BOT • SHADOW CREATION")
+    # 1. Check Cache
+    if cache_key in CACHE:
+        if time.time() - CACHE[cache_key]["time"] < CACHE_TTL:
+            print(f"[CACHE] Hit for {cache_key}")
+            return CACHE[cache_key]["result"], None
 
-    file_bytes = io.BytesIO(result_text.encode("utf-8"))
-    file = discord.File(file_bytes, filename=f"username_{username}_report.txt")
+    # 2. Fetch from API
+    try:
+        async with bot.web_session.get(f"{HF_API_URL}{endpoint}", params=params, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None, f"❌ API Error: HTTP {resp.status}"
+            
+            if "application/json" not in resp.headers.get("Content-Type", ""):
+                return None, "❌ API returned invalid format (HF Space might be offline)."
+            
+            data = await resp.json()
+            if "error" in data:
+                return None, f"❌ Error: {data['error']}"
+            
+            result = data.get("result", "No data returned.")
+            
+            # 3. Save to Cache
+            CACHE[cache_key] = {"result": result, "time": time.time()}
+            return result, None
+            
+    except asyncio.TimeoutError:
+        return None, "❌ API Timeout. The Hugging Face Space might be waking up."
+    except Exception as e:
+        return None, f"❌ Connection error: {str(e)}"
 
-    await interaction.followup.send(embed=embed, file=file)
+# ==========================================
+# COMMANDS
+# ==========================================
+@osint_group.command(name="username", description="Scan username via Maigret")
+@app_commands.describe(username="Target username", invisible="Only you can see the results")
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+async def osint_username(interaction: discord.Interaction, username: str, invisible: bool = False):
+    await interaction.response.defer(thinking=True, ephemeral=invisible)
+    result, error = await fetch_osint("/api/username", {"username": username}, 320)
+    if error: return await interaction.followup.send(error, ephemeral=invisible)
 
-@osint_group.command(name="email", description="Scan email registrations")
-@app_commands.describe(email="Target email address")
-async def osint_email(interaction: discord.Interaction, email: str):
-    await interaction.response.defer(thinking=True)
+    embed = discord.Embed(title=f"🕵️ Username: {username}", color=discord.Color.dark_purple())
+    embed.description = f"```ansi\n{result[:3900]}\n```" 
+    embed.set_footer(text="Full results attached in file.")
     
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(f"{HF_API_URL}/api/email", params={"email": email}, timeout=50) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send("❌ Error connecting to OSINT backend service.")
-                    return
-                data = await resp.json()
-                result_text = data.get("result", "No registrations found.")
-        except Exception as e:
-            await interaction.followup.send(f"❌ Connection timeout or error: {str(e)}")
-            return
+    file = discord.File(io.BytesIO(result.encode("utf-8")), filename=f"username_{username}.txt")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=invisible)
 
-    embed = discord.Embed(
-        title=f"Email Footprint Analysis: {email}",
-        color=discord.Color.blue(),
-        timestamp=discord.utils.utcnow()
-    )
+@osint_group.command(name="email", description="Scan email registrations via Holehe")
+@app_commands.describe(email="Target email", invisible="Only you can see the results")
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+async def osint_email(interaction: discord.Interaction, email: str, invisible: bool = False):
+    await interaction.response.defer(thinking=True, ephemeral=invisible)
+    result, error = await fetch_osint("/api/email", {"email": email}, 60)
+    if error: return await interaction.followup.send(error, ephemeral=invisible)
+
+    embed = discord.Embed(title=f"📧 Email: {email}", color=discord.Color.blue())
+    embed.description = f"```ansi\n{result[:3900]}\n```"
+    embed.set_footer(text="Full results attached in file.")
     
-    display_text = result_text
-    if len(display_text) > 3900:
-        display_text = display_text[:3900] + "\n... [Output truncated in embed preview]"
-        
-    embed.description = f"```ansi\n{display_text}\n```"
-    embed.set_footer(text="OSINT Bot • RED ঌ ")
+    file = discord.File(io.BytesIO(result.encode("utf-8")), filename=f"email_{email}.txt")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=invisible)
 
-    file_bytes = io.BytesIO(result_text.encode("utf-8"))
-    file = discord.File(file_bytes, filename=f"email_report.txt")
+@osint_group.command(name="phone", description="Analyze phone number (Basic metadata)")
+@app_commands.describe(phone="Target phone (+15555555555)", invisible="Only you can see the results")
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+async def osint_phone(interaction: discord.Interaction, phone: str, invisible: bool = False):
+    await interaction.response.defer(thinking=True, ephemeral=invisible)
+    result, error = await fetch_osint("/api/phone", {"phone": phone}, 20)
+    if error: return await interaction.followup.send(error, ephemeral=invisible)
 
-    await interaction.followup.send(embed=embed, file=file)
-
-@osint_group.command(name="phone", description="Analyze phone number via Hugging Face API")
-@app_commands.describe(phone="Target phone number with country code (e.g., +15555555555)")
-async def osint_phone(interaction: discord.Interaction, phone: str):
-    await interaction.response.defer(thinking=True)
+    embed = discord.Embed(title=f"📱 Phone: {phone}", color=discord.Color.green())
+    embed.description = f"```yaml\n{result[:3900]}\n```"
+    embed.set_footer(text="For deeper OSINT, use /osint phoneinfoga")
     
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(f"{HF_API_URL}/api/phone", params={"phone": phone}, timeout=20) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send("❌ Error connecting to phone intelligence endpoint.")
-                    return
-                data = await resp.json()
-                if "error" in data:
-                    await interaction.followup.send(f"❌ Error: {data['error']}")
-                    return
-                result_text = data.get("result", "No data returned.")
-        except Exception as e:
-            await interaction.followup.send(f"❌ Connection timeout or error: {str(e)}")
-            return
+    file = discord.File(io.BytesIO(result.encode("utf-8")), filename=f"phone_{phone}.txt")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=invisible)
 
-    embed = discord.Embed(
-        title=f"Phone Intelligence: {phone}",
-        color=discord.Color.green(),
-        timestamp=discord.utils.utcnow()
-    )
-    embed.description = f"```yaml\n{result_text}\n```"
-    embed.set_footer(text="OSINT Bot • Powered by Hugging Face API")
+@osint_group.command(name="domain", description="Analyze domain & DNS")
+@app_commands.describe(domain="Target domain", invisible="Only you can see the results")
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+async def osint_domain(interaction: discord.Interaction, domain: str, invisible: bool = False):
+    await interaction.response.defer(thinking=True, ephemeral=invisible)
+    result, error = await fetch_osint("/api/domain", {"domain": domain}, 60)
+    if error: return await interaction.followup.send(error, ephemeral=invisible)
 
-    file_bytes = io.BytesIO(result_text.encode("utf-8"))
-    file = discord.File(file_bytes, filename=f"phone_{phone.replace('+', '')}_report.txt")
-
-    await interaction.followup.send(embed=embed, file=file)
-
-@@osint_group.command(name="domain", description="Analyze domain infrastructure and DNS via Hugging Face API")
-@app_commands.describe(domain="Target domain (e.g., example.com)")
-async def osint_domain(interaction: discord.Interaction, domain: str):
-    await interaction.response.defer(thinking=True)
+    embed = discord.Embed(title=f"🌐 Domain: {domain}", color=discord.Color.orange())
+    embed.description = f"```yaml\n{result[:3900]}\n```"
     
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Bumping timeout to 60 seconds
-            async with session.get(f"{HF_API_URL}/api/domain", params={"domain": domain}, timeout=60) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send("❌ Error connecting to domain intelligence endpoint.")
-                    return
-                data = await resp.json()
-                if "error" in data:
-                    await interaction.followup.send(f"❌ Error: {data['error']}")
-                    return
-                result_text = data.get("result", "No data returned.")
-        except Exception as e:
-            await interaction.followup.send(f"❌ Connection timeout or error: {str(e)}")
-            return
+    file = discord.File(io.BytesIO(result.encode("utf-8")), filename=f"domain_{domain}.txt")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=invisible)
 
-    embed = discord.Embed(
-        title=f"Domain Intelligence: {domain}",
-        color=discord.Color.orange(),
-        timestamp=discord.utils.utcnow()
-    )
+@osint_group.command(name="ip", description="Geolocate an IP address")
+@app_commands.describe(ip="Target IP", invisible="Only you can see the results")
+@app_commands.checks.cooldown(1, 60.0, time=1, key=lambda i: i.user.id)
+async def osint_ip(interaction: discord.Interaction, ip: str, invisible: bool = False):
+    await interaction.response.defer(thinking=True, ephemeral=invisible)
+    result, error = await fetch_osint("/api/ip", {"ip": ip}, 15)
+    if error: return await interaction.followup.send(error, ephemeral=invisible)
+
+    embed = discord.Embed(title=f"📍 IP: {ip}", color=discord.Color.gold())
+    embed.description = f"```yaml\n{result[:3900]}\n```"
     
-    display_text = result_text
-    if len(display_text) > 3900:
-        display_text = display_text[:3900] + "\n... [Output truncated in embed preview]"
-        
-    embed.description = f"```yaml\n{display_text}\n```"
-    embed.set_footer(text="OSINT Bot • Powered by Hugging Face API")
+    file = discord.File(io.BytesIO(result.encode("utf-8")), filename=f"ip_{ip}.txt")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=invisible)
 
-    file_bytes = io.BytesIO(result_text.encode("utf-8"))
-    file = discord.File(file_bytes, filename=f"domain_{domain}_report.txt")
+@osint_group.command(name="headers", description="Scan HTTP headers for security flaws")
+@app_commands.describe(url="Target URL (e.g., example.com)", invisible="Only you can see the results")
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+async def osint_headers(interaction: discord.Interaction, url: str, invisible: bool = False):
+    await interaction.response.defer(thinking=True, ephemeral=invisible)
+    result, error = await fetch_osint("/api/headers", {"url": url}, 20)
+    if error: return await interaction.followup.send(error, ephemeral=invisible)
 
-    await interaction.followup.send(embed=embed, file=file)
+    embed = discord.Embed(title=f"🛡️ Headers: {url}", color=discord.Color.teal())
+    embed.description = f"```yaml\n{result[:3900]}\n```"
+    
+    file = discord.File(io.BytesIO(result.encode("utf-8")), filename=f"headers_{url.replace('https://','').replace('http://','')}.txt")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=invisible)
 
+@osint_group.command(name="github", description="Scan a GitHub profile")
+@app_commands.describe(username="Target GitHub username", invisible="Only you can see the results")
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+async def osint_github(interaction: discord.Interaction, username: str, invisible: bool = False):
+    await interaction.response.defer(thinking=True, ephemeral=invisible)
+    result, error = await fetch_osint("/api/github", {"username": username}, 20)
+    if error: return await interaction.followup.send(error, ephemeral=invisible)
+
+    embed = discord.Embed(title=f"🐙 GitHub: {username}", color=discord.Color.dark_grey())
+    embed.description = f"```yaml\n{result[:3900]}\n```"
+    
+    file = discord.File(io.BytesIO(result.encode("utf-8")), filename=f"github_{username}.txt")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=invisible)
+
+# ==========================================
+# NEW TOOLS COMMANDS
+# ==========================================
+@osint_group.command(name="harvester", description="Gather emails, hosts, and subdomains")
+@app_commands.describe(domain="Target domain (e.g., example.com)", invisible="Only you can see the results")
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+async def osint_harvester(interaction: discord.Interaction, domain: str, invisible: bool = False):
+    await interaction.response.defer(thinking=True, ephemeral=invisible)
+    result, error = await fetch_osint("/api/harvester", {"domain": domain}, 120)
+    if error: return await interaction.followup.send(error, ephemeral=invisible)
+
+    embed = discord.Embed(title=f"🌾 theHarvester: {domain}", color=discord.Color.dark_gold())
+    embed.description = f"```yaml\n{result[:3900]}\n```"
+    
+    file = discord.File(io.BytesIO(result.encode("utf-8")), filename=f"harvester_{domain}.txt")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=invisible)
+
+@osint_group.command(name="phoneinfoga", description="Advanced phone OSINT")
+@app_commands.describe(phone="Target phone number (+1234567890)", invisible="Only you can see the results")
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+async def osint_phoneinfoga(interaction: discord.Interaction, phone: str, invisible: bool = False):
+    await interaction.response.defer(thinking=True, ephemeral=invisible)
+    result, error = await fetch_osint("/api/phoneinfoga", {"phone": phone}, 60)
+    if error: return await interaction.followup.send(error, ephemeral=invisible)
+
+    embed = discord.Embed(title=f"📞 PhoneInfoga: {phone}", color=discord.Color.dark_green())
+    embed.description = f"```yaml\n{result[:3900]}\n```"
+    
+    file = discord.File(io.BytesIO(result.encode("utf-8")), filename=f"phoneinfoga_{phone}.txt")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=invisible)
+
+@osint_group.command(name="sublist3r", description="Enumerate subdomains")
+@app_commands.describe(domain="Target domain (e.g., example.com)", invisible="Only you can see the results")
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+async def osint_sublist3r(interaction: discord.Interaction, domain: str, invisible: bool = False):
+    await interaction.response.defer(thinking=True, ephemeral=invisible)
+    result, error = await fetch_osint("/api/sublist3r", {"domain": domain}, 120)
+    if error: return await interaction.followup.send(error, ephemeral=invisible)
+
+    embed = discord.Embed(title=f"🌐 Sublist3r: {domain}", color=discord.Color.dark_blue())
+    embed.description = f"```yaml\n{result[:3900]}\n```"
+    
+    file = discord.File(io.BytesIO(result.encode("utf-8")), filename=f"sublist3r_{domain}.txt")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=invisible)
+
+# ==========================================
+# HELP MENU
+# ==========================================
 @osint_group.command(name="help", description="Display the OSINT toolkit help menu")
 async def osint_help(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🕵️‍♂️ OSINT Intelligence Suite - Help Menu",
-        description="Here are all the available reconnaissance commands powered by your distributed architecture.",
-        color=discord.Color.gold(),
-        timestamp=discord.utils.utcnow()
+        title="🕵️‍♂️ OSINT Suite",
+        description="*Tip: Add `invisible: True` to any command to hide results from others.*\n*Bot has a 10-minute cache to prevent spamming.*",
+        color=discord.Color.gold()
     )
-    embed.add_field(
-        name="/osint username", 
-        value="Scans a target username across hundreds of online platforms using the Maigret engine.", 
-        inline=False
-    )
-    embed.add_field(
-        name="/osint email", 
-        value="Checks account registrations associated with an email address using the Holehe engine.", 
-        inline=False
-    )
-    embed.add_field(
-        name="/osint phone", 
-        value="Analyzes metadata, carrier details, and regional attributes for a given phone number.", 
-        inline=False
-    )
-    embed.add_field(
-        name="/osint domain", 
-        value="Performs WHOIS registration lookups, DNS infrastructure scans, and subdomain enumeration.", 
-        inline=False
-    )
-    embed.set_footer(text="OSINT Bot • 24/7 Keep-Alive Active")
+    embed.add_field(name="👤 Identity", value="`/osint username` - Platform scan via Maigret\n`/osint email` - Email registrations via Holehe\n`/osint github` - GitHub profile recon", inline=False)
+    embed.add_field(name="🌐 Infrastructure", value="`/osint domain` - WHOIS, DNS, Subdomains\n`/osint ip` - IP Geolocation & Proxy check\n`/osint headers` - HTTP Header security analysis\n`/osint harvester` - Emails, hosts & subdomains\n`/osint sublist3r` - Subdomain enumeration", inline=False)
+    embed.add_field(name="📱 Phone", value="`/osint phone` - Basic phone metadata\n`/osint phoneinfoga` - Advanced phone OSINT", inline=False)
+    
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# Add the group to the tree
 bot.tree.add_command(osint_group)
 
 if __name__ == "__main__":
     if not TOKEN or not HF_API_URL:
         print("[!] CRITICAL: DISCORD_TOKEN or HF_API_URL is missing from environment variables.")
     else:
-        keep_alive()
         bot.run(TOKEN)
-                     
