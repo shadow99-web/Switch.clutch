@@ -1,5 +1,3 @@
 discord.py
 aiohttp
 python-dotenv
-phonenumbers
-flask
